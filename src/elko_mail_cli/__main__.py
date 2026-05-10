@@ -247,5 +247,11 @@ def fetch(
         typer.echo(f"Wrote {len(raw_messages)} messages → {mbox_file}")
 
 
+@app.command()
+def version():
+    """Show version."""
+    typer.echo("elko-mail-cli 0.1.0")
+
+
 if __name__ == "__main__":
     app()
