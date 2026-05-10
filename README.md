@@ -15,13 +15,74 @@ A minimal, secure, read-only email fetching CLI designed for feeding clean email
 pip install .
 ```
 
-## Setup: Gmail OAuth2
+## Credentials
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → Credentials
-2. Create an **OAuth 2.0 Client ID** (type: Desktop App)
-3. Download the JSON and save it as `~/.config/elko-mail/credentials.json`
+There are two credential files. You create one manually (once); the other is generated automatically on first run.
 
-On first run, the CLI will open a browser (or print a URL for headless/Docker) to complete the OAuth flow. The resulting token is saved at `~/.config/elko-mail/credentials/<email>.json` with `0600` permissions and auto-refreshed on subsequent runs.
+### File 1 — OAuth client secrets (`credentials.json`)
+
+This file identifies *your Google Cloud application* to Google. You create it once and never touch it again.
+
+**Steps:**
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a project (or pick an existing one).
+2. In the left menu: **APIs & Services → Library** — search for **Gmail API** and click **Enable**.
+3. **APIs & Services → OAuth consent screen**
+   - Choose **External** (or Internal if you're on Google Workspace).
+   - Fill in App name (anything, e.g. `elko-mail`), support email, and developer email. Save.
+   - Under **Scopes**, add `https://mail.google.com/` (or click "Add or remove scopes" and search for Gmail).
+   - Under **Test users**, add the Gmail address(es) you'll be fetching from. Save.
+4. **APIs & Services → Credentials → + Create Credentials → OAuth 2.0 Client ID**
+   - Application type: **Desktop app**
+   - Name: anything (e.g. `elko-mail-desktop`)
+   - Click **Create**
+5. Click **Download JSON** on the newly created client ID.
+6. Save the downloaded file as:
+
+```
+~/.config/elko-mail/credentials.json
+```
+
+```bash
+mkdir -p ~/.config/elko-mail
+mv ~/Downloads/client_secret_*.json ~/.config/elko-mail/credentials.json
+chmod 600 ~/.config/elko-mail/credentials.json
+```
+
+> **Headless / Docker alternative:** place `credentials.json` in the current working directory instead of `~/.config/elko-mail/`.
+
+---
+
+### File 2 — OAuth token (`~/.config/elko-mail/credentials/<email>.json`)
+
+This file is created automatically on first run. It holds the access + refresh token for a specific email address. You never create or edit it by hand.
+
+**On first run** the CLI will either:
+- Open your browser to complete the Google sign-in (default), or
+- Print a URL to visit manually and prompt for an authorization code (`--headless`)
+
+Once you approve access, the token is saved:
+
+```
+~/.config/elko-mail/credentials/you@gmail.com.json   ← permissions: 0600
+```
+
+On every subsequent run the token is loaded from disk and silently refreshed when it expires. You only re-authenticate if you delete the file or revoke access in your Google account.
+
+---
+
+### Summary
+
+| File | What it is | Who creates it | Where it lives |
+|------|-----------|---------------|----------------|
+| `credentials.json` | OAuth client secrets (app identity) | You — downloaded from Google Cloud | `~/.config/elko-mail/credentials.json` |
+| `<email>.json` | OAuth token (your sign-in session) | CLI — auto-generated on first run | `~/.config/elko-mail/credentials/<email>.json` |
+
+---
+
+### Generic IMAP
+
+No files needed. The CLI prompts for your password at runtime (not stored anywhere).
 
 ## Usage
 
