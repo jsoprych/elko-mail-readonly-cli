@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "elko-mail-cli"
+version = "0.1.0"
+description = "A minimal, secure, read-only email fetching CLI for local LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.12",
+    "google-auth-oauthlib>=1.2",
+]
+
+[project.scripts]
+elko-mail = "elko_mail_cli.__main__:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/elko_mail_cli"]
