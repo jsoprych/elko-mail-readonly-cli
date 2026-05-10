@@ -101,8 +101,11 @@ def _load_gmail_credentials(email_addr: str, config_dir: Path, headless: bool) -
         secrets_path = _find_client_secrets(config_dir)
         flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), GMAIL_SCOPES)
         if headless:
-            typer.echo("Starting console OAuth2 flow — follow the URL below:", err=True)
-            creds = flow.run_console()
+            auth_url, _ = flow.authorization_url(prompt="consent")
+            typer.echo(f"\nVisit this URL to authorize:\n\n  {auth_url}\n", err=True)
+            code = typer.prompt("Enter the authorization code")
+            flow.fetch_token(code=code)
+            creds = flow.credentials
         else:
             typer.echo("Opening browser for OAuth2 authorization...", err=True)
             creds = flow.run_local_server(port=0)
