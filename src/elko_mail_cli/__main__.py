@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import collections
 import email as _email_lib
 import getpass
+import hashlib
 import html.parser
 import imaplib
 import json
@@ -30,6 +33,58 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+# ---------------------------------------------------------------------------
+# IMAP envelope parsing
+# ---------------------------------------------------------------------------
+
+_RE_UID          = re.compile(r'\bUID\s+(\d+)', re.IGNORECASE)
+_RE_FLAGS        = re.compile(r'\bFLAGS\s+\(([^)]*)\)', re.IGNORECASE)
+_RE_INTERNALDATE = re.compile(r'\bINTERNALDATE\s+"([^"]+)"', re.IGNORECASE)
+_RE_GM_THRID     = re.compile(r'\bX-GM-THRID\s+(\d+)', re.IGNORECASE)
+_RE_GM_MSGID     = re.compile(r'\bX-GM-MSGID\s+(\d+)', re.IGNORECASE)
+_RE_GM_LABELS    = re.compile(r'\bX-GM-LABELS\s+\(([^)]*)\)', re.IGNORECASE)
+
+
+def _parse_internaldate(s: str) -> str | None:
+    """Convert IMAP INTERNALDATE string to UTC ISO8601."""
+    try:
+        dt = datetime.strptime(s.strip(), "%d-%b-%Y %H:%M:%S %z")
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def _parse_gm_labels(raw: str) -> list[str]:
+    """Parse Gmail labels — handles quoted labels with spaces."""
+    return [m.group(1) or m.group(2) for m in re.finditer(r'"([^"]+)"|(\S+)', raw) if m.group(1) or m.group(2)]
+
+
+def _parse_envelope(envelope: bytes) -> dict:
+    """Extract UID, FLAGS, INTERNALDATE, X-GM-* from an IMAP FETCH response line."""
+    text = envelope.decode("utf-8", errors="replace")
+
+    uid_m    = _RE_UID.search(text)
+    flags_m  = _RE_FLAGS.search(text)
+    date_m   = _RE_INTERNALDATE.search(text)
+    thrid_m  = _RE_GM_THRID.search(text)
+    msgid_m  = _RE_GM_MSGID.search(text)
+    labels_m = _RE_GM_LABELS.search(text)
+
+    flags_raw = flags_m.group(1) if flags_m else ""
+    flags = [f.strip() for f in flags_raw.split() if f.strip()]
+
+    return {
+        "uid":           uid_m.group(1) if uid_m else "",
+        "flags":         flags,
+        "internal_date": _parse_internaldate(date_m.group(1)) if date_m else None,
+        "gm_thrid":      thrid_m.group(1) if thrid_m else None,
+        "gm_msgid":      msgid_m.group(1) if msgid_m else None,
+        "gm_labels":     _parse_gm_labels(labels_m.group(1)) if labels_m else [],
+    }
+
+# ---------------------------------------------------------------------------
+# Header decoding
+# ---------------------------------------------------------------------------
 
 def _decode_header_value(value: str | None) -> str:
     if not value:
@@ -43,6 +98,17 @@ def _decode_header_value(value: str | None) -> str:
             decoded.append(str(part))
     return "".join(decoded)
 
+
+def _all_headers(msg: _email_lib.message.Message) -> dict[str, list[str]]:
+    """Return every header as {name: [value, ...]} — nothing silently dropped."""
+    result: dict[str, list[str]] = collections.defaultdict(list)
+    for k, v in msg.items():
+        result[k].append(v)
+    return dict(result)
+
+# ---------------------------------------------------------------------------
+# Text / HTML processing
+# ---------------------------------------------------------------------------
 
 def _normalize_whitespace(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
@@ -61,23 +127,20 @@ def _strip_html(raw_html: str) -> str:
     """
 
     class _HTMLToText(html.parser.HTMLParser):
-        _SKIP = frozenset({"script", "style", "head"})
-        _BLOCK = frozenset({
-            "p", "div", "section", "article", "header", "footer",
-            "main", "nav", "aside", "table", "tbody", "thead", "tfoot",
-        })
+        _SKIP    = frozenset({"script", "style", "head"})
+        _BLOCK   = frozenset({"p", "div", "section", "article", "header", "footer",
+                               "main", "nav", "aside", "table", "tbody", "thead", "tfoot"})
         _HEADINGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
-        _BOLD = frozenset({"strong", "b"})
+        _BOLD    = frozenset({"strong", "b"})
 
         def __init__(self) -> None:
             super().__init__(convert_charrefs=True)
-            # Stack of output buffers; each scope (link, blockquote) pushes a new frame.
             self._bufs: list[list[str]] = [[]]
             self._scopes: list[tuple[str, str]] = [("root", "")]
             self._skip_depth = 0
             self._bold_depth = 0
-            self._list_stack: list[str] = []   # "ul" or "ol"
-            self._ol_counters: list[int] = []  # counter per active <ol>
+            self._list_stack: list[str] = []
+            self._ol_counters: list[int] = []
 
         def _write(self, text: str) -> None:
             self._bufs[-1].append(text)
@@ -97,46 +160,37 @@ def _strip_html(raw_html: str) -> str:
             if tag in self._SKIP:
                 self._skip_depth += 1
                 return
-
             d = dict(attrs)
-
             if tag == "a":
                 href = d.get("href", "").strip()
                 if href and not href.startswith("#"):
                     self._push("link", href)
                 return
-
             if tag == "img":
                 alt = d.get("alt", "").strip()
                 if alt:
                     self._write(f"[image: {alt}]")
                 return
-
             if tag in self._BOLD:
                 self._bold_depth += 1
                 if self._bold_depth == 1:
                     self._write("**")
                 return
-
             if tag == "blockquote":
                 self._write("\n")
                 self._push("bq")
                 return
-
             if tag == "br":
                 self._write("\n")
                 return
-
             if tag == "hr":
                 self._write("\n---\n")
                 return
-
             if tag in ("ul", "ol"):
                 self._list_stack.append(tag)
                 if tag == "ol":
                     self._ol_counters.append(0)
                 return
-
             if tag == "li":
                 if self._list_stack and self._list_stack[-1] == "ol":
                     self._ol_counters[-1] += 1
@@ -144,11 +198,9 @@ def _strip_html(raw_html: str) -> str:
                 else:
                     self._write("\n• ")
                 return
-
             if tag in self._HEADINGS:
                 self._write(f"\n{'#' * self._HEADINGS[tag]} ")
                 return
-
             if tag in self._BLOCK or tag in ("td", "th"):
                 self._write("\n")
 
@@ -158,20 +210,17 @@ def _strip_html(raw_html: str) -> str:
                 return
             if self._skip_depth > 0:
                 return
-
             if tag == "a":
                 if len(self._scopes) > 1 and self._scopes[-1][0] == "link":
                     _, href, text = self._pop()
                     text = text.strip()
                     self._write(f"[{text}]({href})" if text else href)
                 return
-
             if tag in self._BOLD:
                 self._bold_depth = max(0, self._bold_depth - 1)
                 if self._bold_depth == 0:
                     self._write("**")
                 return
-
             if tag == "blockquote":
                 if len(self._scopes) > 1 and self._scopes[-1][0] == "bq":
                     _, _, content = self._pop()
@@ -179,7 +228,6 @@ def _strip_html(raw_html: str) -> str:
                     quoted = "\n".join(f"> {ln}" if ln.strip() else ">" for ln in lines)
                     self._write(quoted + "\n")
                 return
-
             if tag in ("ul", "ol"):
                 if self._list_stack:
                     removed = self._list_stack.pop()
@@ -187,7 +235,6 @@ def _strip_html(raw_html: str) -> str:
                         self._ol_counters.pop()
                 self._write("\n")
                 return
-
             if tag in self._HEADINGS or tag in self._BLOCK:
                 self._write("\n")
 
@@ -205,7 +252,7 @@ def _strip_html(raw_html: str) -> str:
 
 
 def _get_html_body(msg: _email_lib.message.Message) -> str:
-    """Return the raw text/html part, or '' if the message has no HTML part."""
+    """Return the raw text/html part, or '' if none."""
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
@@ -225,11 +272,10 @@ def _get_html_body(msg: _email_lib.message.Message) -> str:
 
 
 def _make_snippet(body: str, length: int = 200) -> str:
-    """Strip markdown markers and return first `length` chars — clean LLM preview."""
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", body)       # [text](url) → text
-    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)             # **bold** → bold
-    text = re.sub(r"^#{1,6} ", "", text, flags=re.MULTILINE)   # headings
-    text = re.sub(r"^>+ ?", "", text, flags=re.MULTILINE)      # blockquotes
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", body)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"^#{1,6} ", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^>+ ?", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\[image:[^\]]+\]", "", text, flags=re.MULTILINE)
     text = re.sub(r"^---$", "", text, flags=re.MULTILINE)
     text = _normalize_whitespace(text)
@@ -237,11 +283,6 @@ def _make_snippet(body: str, length: int = 200) -> str:
 
 
 def _strip_quoted(body: str) -> str:
-    """Heuristic: return just the new text from a reply, dropping quoted history.
-
-    Stops at the first blockquote marker (> ) or 'On ... wrote:' separator.
-    Not perfect for all clients but covers the common cases.
-    """
     lines = body.split("\n")
     result = []
     for line in lines:
@@ -253,28 +294,8 @@ def _strip_quoted(body: str) -> str:
     return _normalize_whitespace("\n".join(result))
 
 
-def _get_attachments(msg: _email_lib.message.Message) -> list[dict]:
-    """Return metadata (no content) for each attachment part."""
-    attachments = []
-    if not msg.is_multipart():
-        return attachments
-    for part in msg.walk():
-        cd = str(part.get("Content-Disposition", ""))
-        if "attachment" not in cd:
-            continue
-        filename = _decode_header_value(part.get_filename() or "")
-        payload = part.get_payload(decode=True)
-        attachments.append({
-            "filename": filename,
-            "content_type": part.get_content_type(),
-            "size": len(payload) if payload else 0,
-        })
-    return attachments
-
-
 def _get_text_body(msg: _email_lib.message.Message) -> str:
     html_fallback: str | None = None
-
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
@@ -295,15 +316,52 @@ def _get_text_body(msg: _email_lib.message.Message) -> str:
         if payload:
             charset = msg.get_content_charset() or "utf-8"
             text = payload.decode(charset, errors="replace")
-            ct = msg.get_content_type()
-            if ct == "text/html":
+            if msg.get_content_type() == "text/html":
                 return _strip_html(text)
             return _normalize_whitespace(text)
-
     if html_fallback is not None:
         return _strip_html(html_fallback)
     return ""
 
+# ---------------------------------------------------------------------------
+# Attachment extraction (with content)
+# ---------------------------------------------------------------------------
+
+def _get_attachments(msg: _email_lib.message.Message) -> list[dict]:
+    """Extract all attachment and inline parts with full content."""
+    parts = []
+    if not msg.is_multipart():
+        return parts
+    for part in msg.walk():
+        ct = part.get_content_type()
+        cd = str(part.get("Content-Disposition", ""))
+        cid = part.get("Content-ID", "").strip()
+
+        is_attachment = "attachment" in cd
+        is_inline = ("inline" in cd and bool(cid))  # inline with Content-ID = embedded image
+
+        if not is_attachment and not is_inline:
+            continue
+        if ct.startswith("multipart/"):
+            continue
+
+        filename = _decode_header_value(part.get_filename() or "")
+        payload = part.get_payload(decode=True)
+
+        parts.append({
+            "filename":       filename,
+            "content_type":   ct,
+            "size":           len(payload) if payload else 0,
+            "content_id":     cid,
+            "is_inline":      is_inline,
+            "sha256":         hashlib.sha256(payload).hexdigest() if payload else None,
+            "content_base64": base64.b64encode(payload).decode("ascii") if payload else None,
+        })
+    return parts
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
 
 def _resolve_config_dir(config_dir_str: Optional[str]) -> Path:
     return Path(config_dir_str) if config_dir_str else DEFAULT_CONFIG_DIR
@@ -321,8 +379,7 @@ def _find_client_secrets(config_dir: Path) -> Path:
     typer.echo(
         "ERROR: OAuth client secrets not found.\n"
         "Download credentials.json from Google Cloud Console and place it at:\n"
-        f"  {candidates[0]}\n"
-        "or in the current directory.",
+        f"  {candidates[0]}\nor in the current directory.",
         err=True,
     )
     raise typer.Exit(1)
@@ -389,32 +446,56 @@ def _imap_connect_generic(server: str, email_addr: str) -> imaplib.IMAP4_SSL:
     imap.login(email_addr, password)
     return imap
 
+# ---------------------------------------------------------------------------
+# IMAP fetch — UIDs, FLAGS, INTERNALDATE, Gmail extensions
+# ---------------------------------------------------------------------------
 
-def _fetch_raw_messages(imap: imaplib.IMAP4_SSL, folder: str, limit: int) -> list[tuple[str, bytes]]:
+def _fetch_messages(
+    imap: imaplib.IMAP4_SSL,
+    folder: str,
+    limit: int,
+    is_gmail: bool,
+) -> list[dict]:
+    """Fetch messages using stable UIDs with full IMAP metadata."""
     typ, data = imap.select(f'"{folder}"', readonly=True)
     if typ != "OK":
         typer.echo(f"ERROR: Cannot select folder '{folder}'.", err=True)
         raise typer.Exit(1)
 
-    count = int(data[0])
-    if count == 0:
+    # UIDs are stable — sequence numbers shift when messages are expunged
+    typ, uid_data = imap.uid("search", None, "ALL")
+    if typ != "OK" or not uid_data or not uid_data[0]:
         return []
 
-    start = max(1, count - limit + 1) if limit > 0 else 1
-    seq_range = f"{start}:{count}"
-
-    typ, raw = imap.fetch(seq_range, "(RFC822)")
-    if typ != "OK" or not raw:
+    all_uids = uid_data[0].split()
+    if not all_uids:
         return []
 
-    results: list[tuple[str, bytes]] = []
-    for item in raw:
-        if isinstance(item, tuple):
-            seq_num = item[0].decode().split()[0]
-            results.append((seq_num, item[1]))
+    target_uids = all_uids[-limit:] if limit > 0 else all_uids
+    uid_list = b",".join(target_uids)
 
-    return list(reversed(results))
+    # Gmail exposes pre-computed thread IDs, internal message IDs, and labels
+    if is_gmail:
+        fetch_items = "(UID RFC822 FLAGS INTERNALDATE X-GM-THRID X-GM-MSGID X-GM-LABELS)"
+    else:
+        fetch_items = "(UID RFC822 FLAGS INTERNALDATE)"
 
+    typ, raw_data = imap.uid("fetch", uid_list, fetch_items)
+    if typ != "OK" or not raw_data:
+        return []
+
+    results = []
+    for item in raw_data:
+        if isinstance(item, tuple) and len(item) == 2:
+            envelope = _parse_envelope(item[0])
+            envelope["raw_bytes"] = item[1]
+            results.append(envelope)
+
+    return list(reversed(results))  # newest first
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
 
 @app.command()
 def fetch(
@@ -440,7 +521,9 @@ def fetch(
     out_path = Path(output)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    if provider == "gmail":
+    is_gmail = (provider == "gmail")
+
+    if is_gmail:
         creds = _load_gmail_credentials(email_addr, cfg_dir, headless)
         imap = _imap_connect_gmail(email_addr, creds)
     else:
@@ -450,7 +533,7 @@ def fetch(
         imap = _imap_connect_generic(server, email_addr)
 
     try:
-        raw_messages = _fetch_raw_messages(imap, folder, limit)
+        messages_data = _fetch_messages(imap, folder, limit, is_gmail)
     finally:
         try:
             imap.close()
@@ -462,83 +545,105 @@ def fetch(
 
     if fmt == "json":
         messages = []
-        for uid, raw_bytes in raw_messages:
+        for item in messages_data:
+            raw_bytes: bytes = item["raw_bytes"]
             msg = _email_lib.message_from_bytes(raw_bytes)
             body = _get_text_body(msg)
+
             messages.append({
-                # Identity & threading
-                "id": uid,
-                "message_id": msg.get("Message-ID", "").strip(),
-                "in_reply_to": msg.get("In-Reply-To", "").strip(),
-                "references": msg.get("References", "").strip(),
-                "thread_index": msg.get("Thread-Index", "").strip(),   # Outlook threading
-                "thread_topic": _decode_header_value(msg.get("Thread-Topic")),
-                # Routing
-                "subject": _decode_header_value(msg.get("Subject")),
-                "from": _decode_header_value(msg.get("From")),
-                "sender": _decode_header_value(msg.get("Sender")),     # actual sender when From is a group
-                "to": _decode_header_value(msg.get("To")),
-                "cc": _decode_header_value(msg.get("CC")),
-                "bcc": _decode_header_value(msg.get("BCC")),
-                "reply_to": _decode_header_value(msg.get("Reply-To")),
-                "delivered_to": msg.get("Delivered-To", "").strip(),
-                # Dates
-                "date": msg.get("Date", ""),
-                "received": [h for h in msg.get_all("Received") or []],  # full hop chain
-                # Content
-                "snippet": _make_snippet(body),
-                "body": body,
-                "body_html": _get_html_body(msg),
-                "stripped_reply": _strip_quoted(body),
-                "attachments": _get_attachments(msg),
-                # Priority & flags
-                "importance": msg.get("Importance", "").strip(),
-                "priority": msg.get("X-Priority", "").strip(),
-                "x_mailer": msg.get("X-Mailer", "").strip(),
-                "list_unsubscribe": msg.get("List-Unsubscribe", "").strip(),
-                "list_id": msg.get("List-ID", "").strip(),
-                # Auth
-                "dkim_signature": "present" if msg.get("DKIM-Signature") else "absent",
+                # --- IMAP metadata (server-authoritative) ---
+                "imap_uid":       item["uid"],
+                "imap_flags":     item["flags"],
+                "internal_date":  item["internal_date"],
+                # --- Gmail extensions ---
+                "gmail_thread_id":  item["gm_thrid"],
+                "gmail_message_id": item["gm_msgid"],
+                "gmail_labels":     item["gm_labels"],
+                # --- RFC 2822 identity & threading ---
+                "message_id":    msg.get("Message-ID", "").strip(),
+                "in_reply_to":   msg.get("In-Reply-To", "").strip(),
+                "references":    msg.get("References", "").strip(),
+                "thread_index":  msg.get("Thread-Index", "").strip(),
+                "thread_topic":  _decode_header_value(msg.get("Thread-Topic")),
+                # --- Routing ---
+                "subject":       _decode_header_value(msg.get("Subject")),
+                "from":          _decode_header_value(msg.get("From")),
+                "sender":        _decode_header_value(msg.get("Sender")),
+                "to":            _decode_header_value(msg.get("To")),
+                "cc":            _decode_header_value(msg.get("CC")),
+                "bcc":           _decode_header_value(msg.get("BCC")),
+                "reply_to":      _decode_header_value(msg.get("Reply-To")),
+                "delivered_to":  msg.get("Delivered-To", "").strip(),
+                "return_path":   msg.get("Return-Path", "").strip(),
+                # --- Timestamps ---
+                "date":          msg.get("Date", ""),
+                "received":      list(msg.get_all("Received") or []),
+                # --- Authentication ---
+                "dkim_signature":         "present" if msg.get("DKIM-Signature") else "absent",
                 "authentication_results": msg.get("Authentication-Results", "").strip(),
-                "received_spf": msg.get("Received-SPF", "").strip(),
-                # Size
-                "raw_size": len(raw_bytes),
+                "received_spf":           msg.get("Received-SPF", "").strip(),
+                "arc_authentication_results": msg.get("ARC-Authentication-Results", "").strip(),
+                # --- Priority / classification ---
+                "importance":          msg.get("Importance", "").strip(),
+                "priority":            msg.get("X-Priority", "").strip(),
+                "x_mailer":            msg.get("X-Mailer", "").strip(),
+                "x_originating_ip":    msg.get("X-Originating-IP", "").strip(),
+                "x_spam_score":        msg.get("X-Spam-Score", "").strip(),
+                "x_spam_status":       msg.get("X-Spam-Status", "").strip(),
+                "list_unsubscribe":    msg.get("List-Unsubscribe", "").strip(),
+                "list_id":             msg.get("List-ID", "").strip(),
+                "precedence":          msg.get("Precedence", "").strip(),
+                "auto_submitted":      msg.get("Auto-Submitted", "").strip(),
+                # --- Content ---
+                "snippet":         _make_snippet(body),
+                "body":            body,
+                "body_html":       _get_html_body(msg),
+                "stripped_reply":  _strip_quoted(body),
+                "attachments":     _get_attachments(msg),
+                # --- Complete header dump (nothing silently dropped) ---
+                "all_headers":     _all_headers(msg),
+                # --- Raw source of truth ---
+                "raw_mime":  base64.b64encode(raw_bytes).decode("ascii"),
+                "raw_size":  len(raw_bytes),
                 "fetched_at": fetched_at,
             })
+
         result = {
-            "provider": provider,
-            "folder": folder,
+            "provider":   provider,
+            "account":    email_addr,
+            "folder":     folder,
             "fetched_at": fetched_at,
-            "count": len(messages),
-            "messages": messages,
+            "count":      len(messages),
+            "messages":   messages,
         }
         out_file = out_path / "messages.json"
         out_file.write_text(json.dumps(result, indent=2, ensure_ascii=False))
         typer.echo(f"Wrote {len(messages)} messages → {out_file}")
 
     elif fmt == "eml":
-        for uid, raw_bytes in raw_messages:
-            (out_path / f"{uid}.eml").write_bytes(raw_bytes)
-        typer.echo(f"Wrote {len(raw_messages)} .eml files → {out_path}/")
+        for item in messages_data:
+            uid = item["uid"] or "unknown"
+            (out_path / f"{uid}.eml").write_bytes(item["raw_bytes"])
+        typer.echo(f"Wrote {len(messages_data)} .eml files → {out_path}/")
 
     elif fmt == "mbox":
         mbox_file = out_path / "messages.mbox"
         mb = mailbox.mbox(str(mbox_file))
         mb.lock()
         try:
-            for _, raw_bytes in raw_messages:
-                mb.add(mailbox.mboxMessage(_email_lib.message_from_bytes(raw_bytes)))
+            for item in messages_data:
+                mb.add(mailbox.mboxMessage(_email_lib.message_from_bytes(item["raw_bytes"])))
             mb.flush()
         finally:
             mb.unlock()
             mb.close()
-        typer.echo(f"Wrote {len(raw_messages)} messages → {mbox_file}")
+        typer.echo(f"Wrote {len(messages_data)} messages → {mbox_file}")
 
 
 @app.command()
 def version():
     """Show version."""
-    typer.echo("elko-mail-cli 0.1.0")
+    typer.echo("elko-mail-cli 0.2.0")
 
 
 if __name__ == "__main__":
