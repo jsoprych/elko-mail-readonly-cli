@@ -466,21 +466,42 @@ def fetch(
             msg = _email_lib.message_from_bytes(raw_bytes)
             body = _get_text_body(msg)
             messages.append({
+                # Identity & threading
                 "id": uid,
                 "message_id": msg.get("Message-ID", "").strip(),
                 "in_reply_to": msg.get("In-Reply-To", "").strip(),
                 "references": msg.get("References", "").strip(),
+                "thread_index": msg.get("Thread-Index", "").strip(),   # Outlook threading
+                "thread_topic": _decode_header_value(msg.get("Thread-Topic")),
+                # Routing
                 "subject": _decode_header_value(msg.get("Subject")),
                 "from": _decode_header_value(msg.get("From")),
+                "sender": _decode_header_value(msg.get("Sender")),     # actual sender when From is a group
                 "to": _decode_header_value(msg.get("To")),
                 "cc": _decode_header_value(msg.get("CC")),
+                "bcc": _decode_header_value(msg.get("BCC")),
                 "reply_to": _decode_header_value(msg.get("Reply-To")),
+                "delivered_to": msg.get("Delivered-To", "").strip(),
+                # Dates
                 "date": msg.get("Date", ""),
+                "received": [h for h in msg.get_all("Received") or []],  # full hop chain
+                # Content
                 "snippet": _make_snippet(body),
                 "body": body,
                 "body_html": _get_html_body(msg),
                 "stripped_reply": _strip_quoted(body),
                 "attachments": _get_attachments(msg),
+                # Priority & flags
+                "importance": msg.get("Importance", "").strip(),
+                "priority": msg.get("X-Priority", "").strip(),
+                "x_mailer": msg.get("X-Mailer", "").strip(),
+                "list_unsubscribe": msg.get("List-Unsubscribe", "").strip(),
+                "list_id": msg.get("List-ID", "").strip(),
+                # Auth
+                "dkim_signature": "present" if msg.get("DKIM-Signature") else "absent",
+                "authentication_results": msg.get("Authentication-Results", "").strip(),
+                "received_spf": msg.get("Received-SPF", "").strip(),
+                # Size
                 "raw_size": len(raw_bytes),
                 "fetched_at": fetched_at,
             })
