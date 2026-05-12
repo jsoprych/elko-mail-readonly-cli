@@ -450,29 +450,51 @@ def _imap_connect_generic(server: str, email_addr: str) -> imaplib.IMAP4_SSL:
 # IMAP fetch — UIDs, FLAGS, INTERNALDATE, Gmail extensions
 # ---------------------------------------------------------------------------
 
+_RE_UID_FETCH = re.compile(r'\bUID\s+(\d+)', re.IGNORECASE)
+
+
 def _fetch_messages(
     imap: imaplib.IMAP4_SSL,
     folder: str,
     limit: int,
     is_gmail: bool,
 ) -> list[dict]:
-    """Fetch messages using stable UIDs with full IMAP metadata."""
+    """Fetch messages using stable UIDs with full IMAP metadata.
+
+    Uses sequence numbers only to identify the most recent N messages,
+    then switches to UIDs for all subsequent operations. Avoids UID SEARCH ALL
+    which returns one giant line that breaks imaplib on large mailboxes.
+    """
     typ, data = imap.select(f'"{folder}"', readonly=True)
     if typ != "OK":
         typer.echo(f"ERROR: Cannot select folder '{folder}'.", err=True)
         raise typer.Exit(1)
 
-    # UIDs are stable — sequence numbers shift when messages are expunged
-    typ, uid_data = imap.uid("search", None, "ALL")
-    if typ != "OK" or not uid_data or not uid_data[0]:
+    count = int(data[0])
+    if count == 0:
         return []
 
-    all_uids = uid_data[0].split()
-    if not all_uids:
+    # Use sequence numbers ONLY to scope which messages we want (most recent N).
+    # We never store or expose sequence numbers — they shift on expunge.
+    start = max(1, count - limit + 1) if limit > 0 else 1
+    seq_range = f"{start}:{count}"
+
+    # Fetch UIDs for the selected sequence range (one short line per message)
+    typ, uid_lines = imap.fetch(seq_range, "(UID)")
+    if typ != "OK" or not uid_lines:
         return []
 
-    target_uids = all_uids[-limit:] if limit > 0 else all_uids
-    uid_list = b",".join(target_uids)
+    uids: list[bytes] = []
+    for item in uid_lines:
+        if isinstance(item, bytes):
+            m = _RE_UID_FETCH.search(item.decode("utf-8", errors="replace"))
+            if m:
+                uids.append(m.group(1).encode())
+
+    if not uids:
+        return []
+
+    uid_list = b",".join(uids)
 
     # Gmail exposes pre-computed thread IDs, internal message IDs, and labels
     if is_gmail:
@@ -485,9 +507,13 @@ def _fetch_messages(
         return []
 
     results = []
-    for item in raw_data:
+    for i, item in enumerate(raw_data):
         if isinstance(item, tuple) and len(item) == 2:
-            envelope = _parse_envelope(item[0])
+            # Gmail returns FLAGS and INTERNALDATE in the bytes item that follows
+            # the tuple, after the RFC822 literal has been consumed by imaplib.
+            trailing = raw_data[i + 1] if i + 1 < len(raw_data) and isinstance(raw_data[i + 1], bytes) else b""
+            combined = item[0] + b" " + trailing
+            envelope = _parse_envelope(combined)
             envelope["raw_bytes"] = item[1]
             results.append(envelope)
 
